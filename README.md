@@ -36,6 +36,25 @@ go build -o analysis
 ```
 
 # 请求示例
+
+## 支持的链接格式（重点）
+
+`share_link` 支持“纯 URL”或“包含文案 + URL”的整段文本。服务端会从文本中提取所有 `http(s)://...` 链接并依次尝试解析（某个链接失败不会影响后续链接的尝试）。
+
+### 抖音（Douyin）
+
+已支持以下 3 种常见形式：
+
+1. 长链（视频页）：`https://www.douyin.com/video/<aweme_id>`
+2. 精选（modal）：`https://www.douyin.com/jingxuan?modal_id=<aweme_id>`
+3. 分享短链：`https://v.douyin.com/<code>/`（服务端会先解一次 302 拿到含 `aweme_id` 的长链）
+
+#### 抖音解析实现要点（用于团队协作理解）
+
+- **不要直接抓取** `www.douyin.com/video/<aweme_id>`：该页面在服务端环境下经常返回风控/验证码/JS 校验页，稳定性差。
+- 稳定方案是：拿到 `aweme_id` 后访问分享页 `https://www.iesdouyin.com/share/video/<aweme_id>/`，从页面的 `window._ROUTER_DATA`（或 `window.__INITIAL_STATE__`）里读取 `video_id` 等结构化数据。
+- 最终可下载地址通过 `https://aweme.snssdk.com/aweme/v1/play/?video_id=<video_id>&ratio=720p&line=0` 的 **302 Location** 获取（`resource_path`）。
+
 ```
 curl --location --request POST 'http://127.0.0.1:8080/analysis' \
 --header 'User-Agent: Apifox/1.0.0 (https://apifox.com)' \
@@ -44,6 +63,32 @@ curl --location --request POST 'http://127.0.0.1:8080/analysis' \
 --header 'Connection: keep-alive' \
 --header 'Content-Type: application/x-www-form-urlencoded' \
 --data-urlencode 'share_link=32 【童趣ins春日清新显白可爱美甲 - 沃小妮妮 | 小红书 - 你的生活指南】 😆 mp9w4UUBKZ3eKDi 😆 http://xhslink.com/98JQgR'
+```
+
+## 抖音请求示例
+
+### 1) 视频页长链
+
+```bash
+curl --location --request POST 'http://127.0.0.1:8080/analysis' \
+  --header 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'share_link=https://www.douyin.com/video/7589977999513046298'
+```
+
+### 2) jingxuan（modal_id）
+
+```bash
+curl --location --request POST 'http://127.0.0.1:8080/analysis' \
+  --header 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'share_link=https://www.douyin.com/jingxuan?modal_id=7580313341361425702'
+```
+
+### 3) 分享短链（带文案）
+
+```bash
+curl --location --request POST 'http://127.0.0.1:8080/analysis' \
+  --header 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'share_link=5.12 mda:/ Y@M.Ji 03/05 快乐加倍 https://v.douyin.com/w6uxkLkkmSk/ 复制此链接，打开Dou音搜索，直接观看视频！'
 ```
 
 # 响应示例
