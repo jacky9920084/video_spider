@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ type DouYinPlatform struct {
 }
 
 var douyinUserAgents = []string{
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1",
 	"Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.108 Mobile Safari/537.36",
 	"Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
 	"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
@@ -114,6 +116,11 @@ func setDouyinHeaders(req *http.Request, userAgent string) {
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Pragma", "no-cache")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Referer", "https://www.douyin.com/")
+	req.Header.Set("Origin", "https://www.douyin.com")
+	if cookie := strings.TrimSpace(os.Getenv("DOUYIN_COOKIE")); cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
 }
 
 func looksBlocked(html string) bool {
@@ -182,139 +189,152 @@ func (dy DouYinPlatform) ParseOut() (record Record, err error) {
 		return Record{}, errors.New("抖音解析失败：未识别到 aweme_id（支持 v.douyin.com 短链、/video/<id>、/share/video/<id>、jingxuan?modal_id=<id>）")
 	}
 
-	// 2) 避开 /video/<id> 直链（容易风控），改用 share 页拿 window._ROUTER_DATA（analysis.exe 同源思路）
-	shareURL := fmt.Sprintf("https://www.iesdouyin.com/share/video/%s/", awemeID)
+	// 2) 优先尝试 m 端 share 页（当前网络环境命中率更高），再回退 iesdouyin
+	shareURLs := []string{
+		fmt.Sprintf("https://m.douyin.com/share/video/%s", awemeID),
+		fmt.Sprintf("https://www.iesdouyin.com/share/video/%s/", awemeID),
+	}
+	blockedDetected := false
 
-	for _, userAgent := range douyinUserAgents {
-		jar, jarErr := cookiejar.New(nil)
-		if jarErr != nil {
-			err = jarErr
-			return
-		}
-		client := newHTTPClient(jar, false)
-		noRedirectClient := newHTTPClient(jar, true)
+	for _, shareURL := range shareURLs {
+		for _, userAgent := range douyinUserAgents {
+			jar, jarErr := cookiejar.New(nil)
+			if jarErr != nil {
+				err = jarErr
+				return
+			}
+			client := newHTTPClient(jar, false)
+			noRedirectClient := newHTTPClient(jar, true)
 
-		req, reqErr := http.NewRequest("GET", shareURL, nil)
-		if reqErr != nil {
-			err = reqErr
-			return
-		}
-		setDouyinHeaders(req, userAgent)
-		htmlRes, doErr := client.Do(req)
-		if doErr != nil {
-			continue
-		}
-		bodyBytes, readErr := io.ReadAll(htmlRes.Body)
-		_ = htmlRes.Body.Close()
-		if readErr != nil {
-			continue
-		}
-		html := string(bodyBytes)
-		if looksBlocked(html) {
-			continue
-		}
+			req, reqErr := http.NewRequest("GET", shareURL, nil)
+			if reqErr != nil {
+				err = reqErr
+				return
+			}
+			setDouyinHeaders(req, userAgent)
+			htmlRes, doErr := client.Do(req)
+			if doErr != nil {
+				continue
+			}
+			bodyBytes, readErr := io.ReadAll(htmlRes.Body)
+			_ = htmlRes.Body.Close()
+			if readErr != nil {
+				continue
+			}
+			html := string(bodyBytes)
+			if looksBlocked(html) {
+				blockedDetected = true
+				continue
+			}
 
-		// 加载html内容, 查找视频资源信息
-		doc, docErr := goquery.NewDocumentFromReader(strings.NewReader(html))
-		if docErr != nil {
-			continue
-		}
-		jsonData := ""
-		doc.Find("script").Each(func(i int, s *goquery.Selection) {
-			scriptText := s.Text()
-			if jsonData == "" && strings.Contains(scriptText, "window._ROUTER_DATA") {
-				start := strings.Index(scriptText, "{")
-				end := strings.LastIndex(scriptText, "}") + 1
-				if start >= 0 && end > start {
-					jsonData = scriptText[start:end]
+			// 加载html内容, 查找视频资源信息
+			doc, docErr := goquery.NewDocumentFromReader(strings.NewReader(html))
+			if docErr != nil {
+				continue
+			}
+			jsonData := ""
+			doc.Find("script").Each(func(i int, s *goquery.Selection) {
+				scriptText := s.Text()
+				if jsonData == "" && strings.Contains(scriptText, "window._ROUTER_DATA") {
+					start := strings.Index(scriptText, "{")
+					end := strings.LastIndex(scriptText, "}") + 1
+					if start >= 0 && end > start {
+						jsonData = scriptText[start:end]
+					}
 				}
-			}
-			if jsonData == "" && strings.Contains(scriptText, "window.__INITIAL_STATE__") {
-				start := strings.Index(scriptText, "{")
-				end := strings.LastIndex(scriptText, "}") + 1
-				if start >= 0 && end > start {
-					jsonData = scriptText[start:end]
+				if jsonData == "" && strings.Contains(scriptText, "window.__INITIAL_STATE__") {
+					start := strings.Index(scriptText, "{")
+					end := strings.LastIndex(scriptText, "}") + 1
+					if start >= 0 && end > start {
+						jsonData = scriptText[start:end]
+					}
 				}
-			}
-		})
-		if jsonData == "" {
-			continue
-		}
-
-		var js json.RawMessage
-		isJson := json.Unmarshal([]byte(jsonData), &js) == nil
-		if !isJson {
-			continue
-		}
-		videoJson := VideoJson{}
-		if unmarshalErr := json.Unmarshal([]byte(jsonData), &videoJson); unmarshalErr != nil {
-			continue
-		}
-
-		// 验证数据合法
-		noteItemList := videoJson.LoaderData.NotePage.VideoInfoRes.ItemList
-		videoItemList := videoJson.LoaderData.VideoPage.VideoInfoRes.ItemList
-		if len(noteItemList) < 1 && len(videoItemList) < 1 {
-			continue
-		}
-
-		// 图文资源 -- 图文两种情况
-		if len(videoItemList) > 0 && len(videoItemList[0].Images) > 0 {
-			var imageResource []string
-			for _, v := range videoItemList[0].Images {
-				imageResource = append(imageResource, v.UrlList[0])
-			}
-			dy.Record.Type = 2
-			dy.Record.Cover = videoItemList[0].Video.Cover.UrlList[0]
-			dy.Record.Title = videoItemList[0].Desc
-			dy.Record.ResourcePath = imageResource
-		}
-		if len(noteItemList) > 0 {
-			var imageResource []string
-			for _, v := range noteItemList[0].Images {
-				imageResource = append(imageResource, v.UrlList[0])
-			}
-			dy.Record.Type = 2
-			dy.Record.Title = noteItemList[0].Desc
-			dy.Record.Cover = noteItemList[0].Images[0].UrlList[0]
-			dy.Record.ResourcePath = imageResource
-		}
-
-		// 视频资源
-		if len(videoItemList) > 0 && len(videoItemList[0].Images) == 0 {
-
-			videoID := videoItemList[0].Video.Player.Uri
-			if videoID == "" {
+			})
+			if jsonData == "" {
+				if strings.Contains(html, "_wafchallengeid") || strings.Contains(html, "验证码中间页") {
+					blockedDetected = true
+				}
 				continue
 			}
 
-			redirectURL := fmt.Sprintf("https://aweme.snssdk.com/aweme/v1/play/?video_id=%s&ratio=720p&line=0", videoID)
-			redirectReq, redirectReqErr := http.NewRequest("GET", redirectURL, nil)
-			if redirectReqErr != nil {
+			var js json.RawMessage
+			isJson := json.Unmarshal([]byte(jsonData), &js) == nil
+			if !isJson {
 				continue
 			}
-			setDouyinHeaders(redirectReq, userAgent)
-			redirectRes, headErr := noRedirectClient.Do(redirectReq)
-			if headErr != nil {
+			videoJson := VideoJson{}
+			if unmarshalErr := json.Unmarshal([]byte(jsonData), &videoJson); unmarshalErr != nil {
 				continue
 			}
-			_ = redirectRes.Body.Close()
-			resourceURL := redirectRes.Header.Get("Location")
-			if resourceURL == "" && len(videoItemList[0].Video.Player.UrlList) > 0 {
-				resourceURL = videoItemList[0].Video.Player.UrlList[0]
+
+			// 验证数据合法
+			noteItemList := videoJson.LoaderData.NotePage.VideoInfoRes.ItemList
+			videoItemList := videoJson.LoaderData.VideoPage.VideoInfoRes.ItemList
+			if len(noteItemList) < 1 && len(videoItemList) < 1 {
+				continue
 			}
 
-			dy.Record.Type = 1
-			dy.Record.Title = videoItemList[0].Desc
-			dy.Record.Cover = videoItemList[0].Video.Cover.UrlList[0]
-			dy.Record.Video = redirectURL
-			dy.Record.ResourcePath = resourceURL
-		}
+			// 图文资源 -- 图文两种情况
+			if len(videoItemList) > 0 && len(videoItemList[0].Images) > 0 {
+				var imageResource []string
+				for _, v := range videoItemList[0].Images {
+					imageResource = append(imageResource, v.UrlList[0])
+				}
+				dy.Record.Type = 2
+				dy.Record.Cover = videoItemList[0].Video.Cover.UrlList[0]
+				dy.Record.Title = videoItemList[0].Desc
+				dy.Record.ResourcePath = imageResource
+			}
+			if len(noteItemList) > 0 {
+				var imageResource []string
+				for _, v := range noteItemList[0].Images {
+					imageResource = append(imageResource, v.UrlList[0])
+				}
+				dy.Record.Type = 2
+				dy.Record.Title = noteItemList[0].Desc
+				dy.Record.Cover = noteItemList[0].Images[0].UrlList[0]
+				dy.Record.ResourcePath = imageResource
+			}
 
-		if dy.Record.Type != 0 {
-			return dy.Record, nil
+			// 视频资源
+			if len(videoItemList) > 0 && len(videoItemList[0].Images) == 0 {
+
+				videoID := videoItemList[0].Video.Player.Uri
+				if videoID == "" {
+					continue
+				}
+
+				redirectURL := fmt.Sprintf("https://aweme.snssdk.com/aweme/v1/play/?video_id=%s&ratio=720p&line=0", videoID)
+				redirectReq, redirectReqErr := http.NewRequest("GET", redirectURL, nil)
+				if redirectReqErr != nil {
+					continue
+				}
+				setDouyinHeaders(redirectReq, userAgent)
+				redirectRes, headErr := noRedirectClient.Do(redirectReq)
+				if headErr != nil {
+					continue
+				}
+				_ = redirectRes.Body.Close()
+				resourceURL := redirectRes.Header.Get("Location")
+				if resourceURL == "" && len(videoItemList[0].Video.Player.UrlList) > 0 {
+					resourceURL = videoItemList[0].Video.Player.UrlList[0]
+				}
+
+				dy.Record.Type = 1
+				dy.Record.Title = videoItemList[0].Desc
+				dy.Record.Cover = videoItemList[0].Video.Cover.UrlList[0]
+				dy.Record.Video = redirectURL
+				dy.Record.ResourcePath = resourceURL
+			}
+
+			if dy.Record.Type != 0 {
+				return dy.Record, nil
+			}
 		}
 	}
 
-	return Record{}, errors.New("抖音解析失败：可能触发风控/验证码，建议改用 v.douyin.com 分享短链")
+	if blockedDetected {
+		return Record{}, errors.New("抖音解析失败：当前网络/IP 触发风控或验证码。建议改用 v.douyin.com 分享短链，或配置环境变量 DOUYIN_COOKIE 后重试")
+	}
+	return Record{}, errors.New("抖音解析失败：未提取到可用数据（页面结构可能变更）")
 }
